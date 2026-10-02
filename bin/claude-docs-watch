@@ -1,0 +1,740 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 OutofControl
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# Track a remote document in a local git repository and send a notification
+# when it changes. Requires bash 3.2+, git and curl.
+
+set -Eeuo pipefail
+
+readonly PROGRAM="claude-docs-watch"
+readonly VERSION="1.0.0"
+
+QUIET=0
+CONFIG_FILE=""
+WORK_DIR=""
+LOCK_DIR=""
+FAILURES=0
+CHANNELS=()
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM [options] [command]
+
+Commands:
+  check         Fetch the document, commit changes, send notifications (default)
+  test-notify   Send a test notification to every configured channel
+
+Options:
+  -c, --config FILE   Read configuration from FILE
+  -q, --quiet         Print errors only
+  -h, --help          Show this help
+  -V, --version       Show the version
+
+Default configuration file: \${XDG_CONFIG_HOME:-~/.config}/$PROGRAM/config
+Exit codes: 0 success, 1 fetch or notification failure, 2 usage or configuration error
+EOF
+}
+
+timestamp() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+log() {
+    ((QUIET)) || printf '%s %s\n' "$(timestamp)" "$*"
+}
+
+err() {
+    printf '%s ERROR: %s\n' "$(timestamp)" "$*" >&2
+}
+
+die() {
+    err "$1"
+    exit "${2:-1}"
+}
+
+cleanup() {
+    [[ -z $WORK_DIR ]] || rm -rf -- "$WORK_DIR"
+    [[ -z $LOCK_DIR ]] || rm -rf -- "$LOCK_DIR"
+    return 0
+}
+
+require_number() {
+    [[ $2 =~ ^[0-9]+$ ]] || die "$1 must be a non-negative integer: $2" 2
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+load_config() {
+    local default_file="${XDG_CONFIG_HOME:-${HOME:?}/.config}/$PROGRAM/config"
+    local file=${CONFIG_FILE:-${CDW_CONFIG:-}}
+
+    if [[ -n $file ]]; then
+        [[ -r $file ]] || die "config file not readable: $file" 2
+    elif [[ -r $default_file ]]; then
+        file=$default_file
+    fi
+
+    if [[ -n $file ]]; then
+        if [[ -n $(find -L "$file" -prune \( -perm -g+r -o -perm -o+r \) 2>/dev/null) ]]; then
+            err "config file is readable by other users: $file (chmod 600 $file)"
+        fi
+        # shellcheck source=/dev/null
+        . "$file"
+    fi
+
+    : "${CDW_URL:=https://code.claude.com/docs/llms-full.txt}"
+    : "${CDW_REPO_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/$PROGRAM}"
+    if [[ -z ${CDW_FILE:-} ]]; then
+        CDW_FILE=${CDW_URL%%[?#]*}
+        CDW_FILE=${CDW_FILE##*/}
+        : "${CDW_FILE:=document.txt}"
+    fi
+    : "${CDW_TITLE:=Claude Code docs changed}"
+    : "${CDW_NOTIFY:=}"
+    CDW_SECTION_PREFIX=${CDW_SECTION_PREFIX-Source: }
+    CDW_DOCS_DIR=${CDW_DOCS_DIR-docs}
+    export CDW_SECTION_PREFIX
+    : "${CDW_MAX_PAGES:=15}"
+    : "${CDW_MIN_BYTES:=1024}"
+    : "${CDW_TIMEOUT:=120}"
+    : "${CDW_NTFY_URL:=https://ntfy.sh}"
+    : "${CDW_NTFY_PRIORITY:=default}"
+    CDW_NTFY_TAGS=${CDW_NTFY_TAGS-books}
+    : "${CDW_EMAIL_DIFF_LINES:=200}"
+    : "${CDW_SMTP_STARTTLS:=1}"
+    : "${CDW_DESKTOP_CMD:=auto}"
+
+    case $CDW_FILE in
+        */* | .* | -*) die "CDW_FILE must be a plain file name: $CDW_FILE" 2 ;;
+    esac
+    case $CDW_DOCS_DIR in
+        */* | .* | -* | "$CDW_FILE") die "CDW_DOCS_DIR must be a plain directory name: $CDW_DOCS_DIR" 2 ;;
+    esac
+    require_number CDW_MAX_PAGES "$CDW_MAX_PAGES"
+    require_number CDW_MIN_BYTES "$CDW_MIN_BYTES"
+    require_number CDW_TIMEOUT "$CDW_TIMEOUT"
+    require_number CDW_EMAIL_DIFF_LINES "$CDW_EMAIL_DIFF_LINES"
+
+    local IFS=', '
+    read -r -a CHANNELS <<<"$CDW_NOTIFY" || true
+}
+
+desktop_backend() {
+    local candidate
+    case $CDW_DESKTOP_CMD in
+        auto)
+            for candidate in terminal-notifier osascript notify-send; do
+                if command -v "$candidate" >/dev/null 2>&1; then
+                    printf '%s\n' "$candidate"
+                    return 0
+                fi
+            done
+            ;;
+        terminal-notifier | osascript | notify-send)
+            if command -v "$CDW_DESKTOP_CMD" >/dev/null 2>&1; then
+                printf '%s\n' "$CDW_DESKTOP_CMD"
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+validate_channels() {
+    local channel
+    ((${#CHANNELS[@]})) || return 0
+    for channel in "${CHANNELS[@]}"; do
+        case $channel in
+            ntfy)
+                [[ -n ${CDW_NTFY_TOPIC:-} ]] || die "ntfy requires CDW_NTFY_TOPIC" 2
+                ;;
+            slack)
+                [[ -n ${CDW_SLACK_WEBHOOK_URL:-} ]] || die "slack requires CDW_SLACK_WEBHOOK_URL" 2
+                ;;
+            email)
+                [[ -n ${CDW_EMAIL_TO:-} ]] || die "email requires CDW_EMAIL_TO" 2
+                : "${CDW_EMAIL_FROM:=}"
+                if [[ -n ${CDW_SMTP_URL:-} ]]; then
+                    [[ -n $CDW_EMAIL_FROM ]] || die "email over SMTP requires CDW_EMAIL_FROM" 2
+                else
+                    if [[ -z ${CDW_SENDMAIL:-} ]]; then
+                        CDW_SENDMAIL=$(command -v sendmail || true)
+                        [[ -n $CDW_SENDMAIL || ! -x /usr/sbin/sendmail ]] || CDW_SENDMAIL=/usr/sbin/sendmail
+                    fi
+                    [[ -n $CDW_SENDMAIL ]] || die "email requires CDW_SMTP_URL or a sendmail command" 2
+                fi
+                ;;
+            desktop)
+                desktop_backend >/dev/null ||
+                    die "desktop requires terminal-notifier, osascript or notify-send (CDW_DESKTOP_CMD=$CDW_DESKTOP_CMD)" 2
+                ;;
+            *)
+                die "unknown notification channel: $channel" 2
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+strip_newlines() {
+    printf '%s' "$1" | tr -d '\r\n'
+}
+
+# Print one "name = value" line for a curl config read from stdin, which keeps
+# secrets out of the process list.
+curl_option() {
+    printf '%s = "%s"\n' "$1" "$(strip_newlines "$2" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# RFC 2047 encode a header value when it contains non-ASCII bytes.
+encode_header() {
+    local LC_ALL=C value
+    value=$(strip_newlines "$1")
+    if [[ $value == *[!\ -~]* ]]; then
+        printf '=?UTF-8?B?%s?=' "$(printf '%s' "$value" | base64 | tr -d '\r\n')"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+# Escape stdin for use inside a JSON string.
+json_escape() {
+    LC_ALL=C tr -d '\000-\010\013-\037' |
+        sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' |
+        awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'
+}
+
+slack_escape() {
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# ---------------------------------------------------------------------------
+# Notification channels. Arguments: title, body file, detail file (optional).
+# ---------------------------------------------------------------------------
+
+send_ntfy() {
+    local title=$1 body_file=$2
+    {
+        curl_option url "${CDW_NTFY_URL%/}/$CDW_NTFY_TOPIC"
+        curl_option header "Title: $(encode_header "$title")"
+        curl_option header "Priority: $CDW_NTFY_PRIORITY"
+        [[ -z $CDW_NTFY_TAGS ]] || curl_option header "Tags: $CDW_NTFY_TAGS"
+        curl_option header "Click: $CDW_URL"
+        curl_option header "Content-Type: text/plain; charset=utf-8"
+        if [[ -n ${CDW_NTFY_TOKEN:-} ]]; then
+            curl_option header "Authorization: Bearer $CDW_NTFY_TOKEN"
+        elif [[ -n ${CDW_NTFY_USER:-} ]]; then
+            curl_option user "$CDW_NTFY_USER:${CDW_NTFY_PASSWORD:-}"
+        fi
+    } | curl --silent --show-error --fail --max-time 30 --output /dev/null \
+        --data-binary "@$body_file" --config -
+}
+
+send_slack() {
+    local title=$1 body_file=$2 payload="$WORK_DIR/slack.json"
+    {
+        printf '{"text":"'
+        {
+            printf '*%s*\n' "$(strip_newlines "$title")"
+            cat "$body_file"
+        } | slack_escape | json_escape
+        printf '"}\n'
+    } >"$payload"
+    {
+        curl_option url "$CDW_SLACK_WEBHOOK_URL"
+        curl_option header "Content-Type: application/json"
+    } | curl --silent --show-error --fail --max-time 30 --output /dev/null \
+        --data-binary "@$payload" --config -
+}
+
+send_email() {
+    local title=$1 body_file=$2 detail_file=${3:-} message="$WORK_DIR/message.eml"
+    local from to recipient
+    local -a recipients
+    from=$(strip_newlines "$CDW_EMAIL_FROM")
+    to=$(strip_newlines "$CDW_EMAIL_TO")
+    {
+        [[ -z $from ]] || printf 'From: %s\n' "$from"
+        printf 'To: %s\n' "$to"
+        printf 'Subject: %s\n' "$(encode_header "$title")"
+        printf 'Date: %s\n' "$(LC_ALL=C date '+%a, %d %b %Y %H:%M:%S %z')"
+        printf 'MIME-Version: 1.0\n'
+        printf 'Content-Type: text/plain; charset=UTF-8\n'
+        printf 'Content-Transfer-Encoding: base64\n\n'
+        {
+            cat "$body_file"
+            if [[ -n $detail_file && -s $detail_file ]]; then
+                printf '\n'
+                cat "$detail_file"
+            fi
+        } | base64 | tr -d '\r\n' | fold -w 76
+        printf '\n'
+    } >"$message"
+
+    if [[ -z ${CDW_SMTP_URL:-} ]]; then
+        "$CDW_SENDMAIL" -t -i <"$message"
+        return
+    fi
+
+    IFS=', ' read -r -a recipients <<<"$to"
+    {
+        curl_option url "$CDW_SMTP_URL"
+        curl_option mail-from "$from"
+        for recipient in "${recipients[@]}"; do
+            curl_option mail-rcpt "$recipient"
+        done
+        [[ -z ${CDW_SMTP_USER:-} ]] || curl_option user "$CDW_SMTP_USER:${CDW_SMTP_PASSWORD:-}"
+        [[ $CDW_SMTP_URL != smtp://* || $CDW_SMTP_STARTTLS == 0 ]] || printf 'ssl-reqd\n'
+        printf 'crlf\n'
+    } | curl --silent --show-error --fail --max-time 60 --upload-file "$message" --config -
+}
+
+send_desktop() {
+    local title=$1 body_file=$2 backend text
+    backend=$(desktop_backend) || return 1
+    text=$(head -n 4 "$body_file")
+    case $backend in
+        terminal-notifier)
+            terminal-notifier -title "$title" -message "$text" -group "$PROGRAM" -open "$CDW_URL" >/dev/null
+            ;;
+        osascript)
+            osascript -e 'on run argv' \
+                -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+                -e 'end run' -- "$title" "$text" >/dev/null
+            ;;
+        notify-send)
+            notify-send --app-name="$PROGRAM" -- "$title" "$text"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Repository
+# ---------------------------------------------------------------------------
+
+# The user's git identity, signing setup and hooks do not apply to this repository.
+repo_git() {
+    git -C "$CDW_REPO_DIR" \
+        -c core.hooksPath=/dev/null \
+        -c core.autocrlf=false \
+        -c commit.gpgsign=false \
+        -c user.name="$PROGRAM" \
+        -c user.email="$PROGRAM@localhost" \
+        "$@"
+}
+
+ensure_repo() {
+    [[ -d $CDW_REPO_DIR/.git ]] && return 0
+    mkdir -p "$CDW_REPO_DIR"
+    git init -q "$CDW_REPO_DIR"
+    repo_git symbolic-ref HEAD refs/heads/main
+}
+
+acquire_lock() {
+    local lock="$CDW_REPO_DIR/.git/$PROGRAM.lock" pid
+    if ! mkdir "$lock" 2>/dev/null; then
+        pid=$(cat "$lock/pid" 2>/dev/null || true)
+        if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            die "another run is in progress (pid $pid)"
+        fi
+        rm -rf -- "$lock"
+        mkdir "$lock" || die "cannot create lock: $lock"
+    fi
+    LOCK_DIR=$lock
+    printf '%s\n' "$$" >"$lock/pid"
+}
+
+fetch_document() {
+    local target=$1 size
+    curl --silent --show-error --fail --location --compressed --retry 2 \
+        --max-time "$CDW_TIMEOUT" --user-agent "$PROGRAM/$VERSION" \
+        --output "$target" "$CDW_URL" || return 1
+    size=$(wc -c <"$target" | tr -d ' ')
+    if ((size < CDW_MIN_BYTES)); then
+        err "response is $size bytes, below CDW_MIN_BYTES=$CDW_MIN_BYTES"
+        return 1
+    fi
+}
+
+record_document() {
+    local fetched=$1
+    cp "$fetched" "$CDW_REPO_DIR/$CDW_FILE"
+    repo_git add -f -- "$CDW_FILE"
+    update_pages "$fetched"
+    if ! repo_git rev-parse --verify -q HEAD >/dev/null; then
+        repo_git commit -q -m "Baseline of $CDW_URL"
+        log "Baseline recorded in $CDW_REPO_DIR."
+    elif repo_git diff --cached --quiet; then
+        log "No change."
+        return 0
+    elif repo_git diff --cached --quiet -- "$CDW_FILE"; then
+        repo_git commit -q -m "Rebuild $CDW_DOCS_DIR"
+        log "Pages rebuilt as $(repo_git rev-parse --short HEAD)."
+    else
+        repo_git commit -q -m "Update $CDW_FILE"
+        log "Change recorded as $(repo_git rev-parse --short HEAD)."
+    fi
+    # An unpacked change stores a full copy of the document.
+    repo_git gc --quiet
+}
+
+# ---------------------------------------------------------------------------
+# Page files
+# ---------------------------------------------------------------------------
+
+# Print one "line<TAB>file<TAB>url<TAB>title" row per page of document $1. A
+# page starts at a "# " heading directly above a section marker. The file path
+# comes from the section URL, relative to the directory of CDW_URL, reduced to
+# a safe character set and made unique without regard to case.
+page_manifest() {
+    local base=${CDW_URL%%[?#]*}
+    CDW_BASE_URL="${base%/*}/" LC_ALL=C awk '
+        BEGIN {
+            prefix = ENVIRON["CDW_SECTION_PREFIX"]
+            base = ENVIRON["CDW_BASE_URL"]
+            used["index"] = 1
+        }
+        index($0, prefix) == 1 && previous ~ /^# / {
+            url = substr($0, length(prefix) + 1)
+            title = substr(previous, 3)
+            gsub(/[\t\r]/, " ", url)
+            gsub(/[\t\r]/, " ", title)
+            path = url
+            if (index(path, base) == 1) path = substr(path, length(base) + 1)
+            else sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/]*/, "", path)
+            sub(/[?#].*$/, "", path)
+            gsub(/[^A-Za-z0-9._\/-]/, "_", path)
+            count = split(path, parts, "/")
+            clean = ""
+            for (i = 1; i <= count; i++) {
+                segment = parts[i]
+                sub(/^[.-]+/, "", segment)
+                if (segment != "") clean = clean (clean == "" ? "" : "/") segment
+            }
+            if (clean == "") clean = "page"
+            candidate = clean
+            for (copy = 2; tolower(candidate) in used; copy++) candidate = clean "-" copy
+            used[tolower(candidate)] = 1
+            printf "%d\t%s.md\t%s\t%s\n", NR - 1, candidate, url, title
+        }
+        { previous = $0 }
+    ' "$1"
+}
+
+# Write the pages listed in manifest $1 from document $2 into directory $3.
+# Links to another page become relative file links. Other links that start
+# with "/" get the origin of the page URL. Trailing blank lines are dropped.
+write_pages() {
+    local manifest=$1 document=$2 out_dir=$3 dir
+    mkdir -p "$out_dir"
+    cut -f2 "$manifest" | sed -n 's|/[^/]*$||p' | LC_ALL=C sort -u | while IFS= read -r dir; do
+        mkdir -p "$out_dir/$dir"
+    done
+    CDW_PAGES_OUT=$out_dir LC_ALL=C awk -F'\t' '
+        function rewrite(line,    out, lead, link, key, anchor, hash, fresh) {
+            if (index(line, "](/") == 0 && index(line, "href=\"/") == 0) return line
+            out = ""
+            while (match(line, /(\]\(|href=")\/[^)" \t]*/)) {
+                lead = substr(line, RSTART, 2) == "](" ? "](" : "href=\""
+                link = substr(line, RSTART + length(lead), RLENGTH - length(lead))
+                anchor = ""
+                hash = index(link, "#")
+                if (hash) { anchor = substr(link, hash); link = substr(link, 1, hash - 1) }
+                key = link
+                sub(/\/$/, "", key)
+                if (key in target) fresh = up target[key] anchor
+                else if (origin != "" && substr(link, 1, 2) != "//") fresh = origin link anchor
+                else fresh = link anchor
+                out = out substr(line, 1, RSTART - 1) lead fresh
+                line = substr(line, RSTART + RLENGTH)
+            }
+            return out line
+        }
+        BEGIN { out_dir = ENVIRON["CDW_PAGES_OUT"] }
+        pass == 1 {
+            start[$1] = $2
+            site = $3
+            if (match(site, /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/]*/)) {
+                origin = substr(site, 1, RLENGTH)
+                site = substr(site, RLENGTH + 1)
+            }
+            sub(/[?#].*$/, "", site)
+            target[site] = $2
+            next
+        }
+        FNR in start {
+            if (file != "") close(file)
+            file = out_dir "/" start[FNR]
+            depth = split(start[FNR], unused, "/") - 1
+            up = ""
+            for (i = 0; i < depth; i++) up = up "../"
+            blanks = 0
+        }
+        file == "" { next }
+        /^[ \t\r]*$/ { blanks++; next }
+        {
+            for (; blanks > 0; blanks--) print "" >file
+            print rewrite($0) >file
+        }
+    ' pass=1 "$manifest" pass=2 "$document"
+}
+
+# Write the root page for manifest $1 to file $2: one link per page, grouped
+# by directory.
+write_index() {
+    CDW_URL="$CDW_URL" LC_ALL=C awk -F'\t' '
+        function escaped(text,    out, i, c) {
+            out = ""
+            for (i = 1; i <= length(text); i++) {
+                c = substr(text, i, 1)
+                out = out (c == "[" || c == "]" || c == "\\" ? "\\" : "") c
+            }
+            return out
+        }
+        {
+            dir = $2
+            if (!sub(/\/[^\/]*$/, "", dir)) dir = ""
+            if (!(dir in items)) order[++groups] = dir
+            items[dir] = items[dir] sprintf("* [%s](%s)\n", escaped($4), $2)
+        }
+        END {
+            printf "# Documentation index\n\n%d pages from <%s>.\n", NR, ENVIRON["CDW_URL"]
+            for (i = 1; i <= groups; i++)
+                printf "\n## %s\n\n%s", (order[i] == "" ? "Pages" : order[i]), items[order[i]]
+        }
+    ' "$1" >"$2"
+}
+
+# Rebuild the page files and the root page in the work tree from document $1
+# and stage them. Pages that left the document lose their file.
+update_pages() {
+    local document=$1 manifest="$WORK_DIR/pages.tsv" out_dir="$WORK_DIR/pages"
+    [[ -n $CDW_DOCS_DIR && -n $CDW_SECTION_PREFIX ]] || return 0
+    page_manifest "$document" >"$manifest"
+    if [[ ! -s $manifest ]]; then
+        err "no pages found in $CDW_FILE: $CDW_DOCS_DIR left as it is"
+        return 0
+    fi
+    write_pages "$manifest" "$document" "$out_dir"
+    write_index "$manifest" "$out_dir/index.md"
+    rm -rf -- "${CDW_REPO_DIR:?}/${CDW_DOCS_DIR:?}"
+    cp -R "$out_dir" "$CDW_REPO_DIR/$CDW_DOCS_DIR"
+    repo_git add -A -f -- "$CDW_DOCS_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Change summary
+# ---------------------------------------------------------------------------
+
+# Print the section names (text after CDW_SECTION_PREFIX) found on stdin.
+section_names() {
+    LC_ALL=C awk '
+        BEGIN { prefix = ENVIRON["CDW_SECTION_PREFIX"] }
+        index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }
+    '
+}
+
+# Print the sections of document $2 that own a non-blank line inside the
+# "start:count" line ranges listed in $1. A line directly above a section
+# marker is the title of that section.
+touched_sections() {
+    LC_ALL=C awk -F: '
+        function mark(name) {
+            if (name != "" && !(name in seen)) { seen[name] = 1; print name }
+        }
+        function in_range(line) {
+            while (k <= n && last[k] < line) k++
+            return k <= n && first[k] <= line
+        }
+        BEGIN { prefix = ENVIRON["CDW_SECTION_PREFIX"]; k = 1 }
+        FILENAME == ARGV[1] {
+            if ($2 > 0) { n++; first[n] = $1; last[n] = $1 + $2 - 1 }
+            next
+        }
+        index($0, prefix) == 1 {
+            current = substr($0, length(prefix) + 1)
+            if (held || in_range(FNR)) mark(current)
+            held = 0
+            next
+        }
+        {
+            if (held) mark(current)
+            held = in_range(FNR) && $0 !~ /^[ \t\r]*$/
+        }
+        END { if (held) mark(current) }
+    ' "$1" "$2"
+}
+
+# Write a notification body and an email detail file for the range $1..$2.
+build_summary() {
+    local from=$1 to=$2 body_file=$3 detail_file=$4
+    local tmp="$WORK_DIR/summary" added=0 removed=0 total shown
+    local pages_changed pages_added pages_removed
+    mkdir -p "$tmp"
+
+    read -r added removed _ <<<"$(repo_git diff --numstat "$from" "$to" -- "$CDW_FILE")" || true
+
+    if [[ -n $CDW_SECTION_PREFIX ]]; then
+        repo_git show "$from:$CDW_FILE" >"$tmp/old"
+        repo_git show "$to:$CDW_FILE" >"$tmp/new"
+        repo_git diff -U0 "$from" "$to" -- "$CDW_FILE" |
+            sed -n 's/^@@ -\([0-9]*\),\{0,1\}\([0-9]*\) +\([0-9]*\),\{0,1\}\([0-9]*\) @@.*/\1:\2:\3:\4/p' >"$tmp/hunks"
+        awk -F: '{ print $1 ":" ($2 == "" ? 1 : $2) }' "$tmp/hunks" >"$tmp/old.ranges"
+        awk -F: '{ print $3 ":" ($4 == "" ? 1 : $4) }' "$tmp/hunks" >"$tmp/new.ranges"
+        section_names <"$tmp/old" | LC_ALL=C sort -u >"$tmp/old.sections"
+        section_names <"$tmp/new" | LC_ALL=C sort -u >"$tmp/new.sections"
+        {
+            touched_sections "$tmp/old.ranges" "$tmp/old"
+            touched_sections "$tmp/new.ranges" "$tmp/new"
+        } | LC_ALL=C sort -u >"$tmp/touched"
+        LC_ALL=C comm -13 "$tmp/old.sections" "$tmp/new.sections" >"$tmp/added"
+        LC_ALL=C comm -23 "$tmp/old.sections" "$tmp/new.sections" >"$tmp/removed"
+        LC_ALL=C comm -12 "$tmp/old.sections" "$tmp/new.sections" |
+            LC_ALL=C comm -12 - "$tmp/touched" >"$tmp/changed"
+        {
+            sed 's/^/* /' "$tmp/changed"
+            sed 's/^/+ /' "$tmp/added"
+            sed 's/^/- /' "$tmp/removed"
+        } >"$tmp/list"
+        pages_changed=$(wc -l <"$tmp/changed" | tr -d ' ')
+        pages_added=$(wc -l <"$tmp/added" | tr -d ' ')
+        pages_removed=$(wc -l <"$tmp/removed" | tr -d ' ')
+        total=$((pages_changed + pages_added + pages_removed))
+        shown=$((total < CDW_MAX_PAGES ? total : CDW_MAX_PAGES))
+        {
+            printf 'Pages: %s changed, %s added, %s removed. Lines: +%s -%s.\n' \
+                "$pages_changed" "$pages_added" "$pages_removed" "$added" "$removed"
+            head -n "$shown" "$tmp/list"
+            ((total <= shown)) || printf '(and %s more)\n' "$((total - shown))"
+        } >"$body_file"
+    else
+        printf 'Lines: +%s -%s.\n' "$added" "$removed" >"$body_file"
+    fi
+
+    {
+        printf 'Document: %s\n' "$CDW_URL"
+        printf 'Repository: %s\n' "$CDW_REPO_DIR"
+        printf 'Range: %s..%s\n' "$(repo_git rev-parse --short "$from")" "$(repo_git rev-parse --short "$to")"
+        if ((CDW_EMAIL_DIFF_LINES > 0)); then
+            repo_git diff "$from" "$to" -- "$CDW_FILE" >"$tmp/diff"
+            total=$(wc -l <"$tmp/diff" | tr -d ' ')
+            printf '\n'
+            head -n "$CDW_EMAIL_DIFF_LINES" "$tmp/diff" |
+                LC_ALL=C awk '{ print (length($0) > 400 ? substr($0, 1, 400) " [...]" : $0) }'
+            ((total <= CDW_EMAIL_DIFF_LINES)) ||
+                printf '\n[diff truncated: %s of %s lines shown]\n' "$CDW_EMAIL_DIFF_LINES" "$total"
+        fi
+    } >"$detail_file"
+}
+
+# Each channel has a ref pointing at the last commit it announced. A failed
+# channel keeps its ref and is retried on the next run without repeating the
+# channels that succeeded. $1 is HEAD before this run, empty on the first run.
+# Failed sends are counted in FAILURES.
+notify_pending() {
+    local previous_head=$1 head channel ref last body detail
+    ((${#CHANNELS[@]})) || return 0
+    head=$(repo_git rev-parse HEAD)
+    for channel in "${CHANNELS[@]}"; do
+        ref="refs/$PROGRAM/notified/$channel"
+        last=$(repo_git rev-parse --verify -q "$ref" || true)
+        : "${last:=${previous_head:-$head}}"
+        # A commit that only rebuilds the page files is not announced.
+        if [[ $last != "$head" ]] && ! repo_git diff --quiet "$last" "$head" -- "$CDW_FILE"; then
+            body="$WORK_DIR/$last.body"
+            detail="$WORK_DIR/$last.detail"
+            [[ -f $body ]] || build_summary "$last" "$head" "$body" "$detail"
+            if ! "send_$channel" "$CDW_TITLE" "$body" "$detail"; then
+                err "notification failed: $channel"
+                FAILURES=$((FAILURES + 1))
+                continue
+            fi
+            log "Notified via $channel."
+        fi
+        repo_git update-ref "$ref" "$head"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_check() {
+    local fetched="$WORK_DIR/fetched" previous_head
+    ensure_repo
+    acquire_lock
+    fetch_document "$fetched" || die "fetch failed: $CDW_URL"
+    previous_head=$(repo_git rev-parse --verify -q HEAD || true)
+    record_document "$fetched"
+    notify_pending "$previous_head"
+}
+
+cmd_test_notify() {
+    local channel body="$WORK_DIR/test.body"
+    ((${#CHANNELS[@]})) || die "no notification channels configured (CDW_NOTIFY)" 2
+    printf 'Test notification from %s on %s.\n' "$PROGRAM" "$(uname -n)" >"$body"
+    for channel in "${CHANNELS[@]}"; do
+        if "send_$channel" "$CDW_TITLE (test)" "$body" ""; then
+            log "Test notification sent via $channel."
+        else
+            err "notification failed: $channel"
+            FAILURES=$((FAILURES + 1))
+        fi
+    done
+}
+
+main() {
+    local command=check dependency
+    while (($# > 0)); do
+        case $1 in
+            -c | --config)
+                (($# > 1)) || die "$1 requires a file argument" 2
+                CONFIG_FILE=$2
+                shift 2
+                ;;
+            -q | --quiet)
+                QUIET=1
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            -V | --version)
+                printf '%s %s\n' "$PROGRAM" "$VERSION"
+                exit 0
+                ;;
+            check | test-notify)
+                command=$1
+                shift
+                ;;
+            *)
+                usage >&2
+                die "unknown argument: $1" 2
+                ;;
+        esac
+    done
+
+    for dependency in git curl; do
+        command -v "$dependency" >/dev/null 2>&1 || die "missing dependency: $dependency" 2
+    done
+
+    load_config
+    validate_channels
+
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+    WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/$PROGRAM.XXXXXX") || die "cannot create a temporary directory"
+
+    case $command in
+        check) cmd_check ;;
+        test-notify) cmd_test_notify ;;
+    esac
+    ((FAILURES == 0)) || exit 1
+}
+
+main "$@"

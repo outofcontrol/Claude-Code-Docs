@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 OutofControl
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[Unit]
+Description=Check the Claude Code docs for changes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-docs-watch

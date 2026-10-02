@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 OutofControl
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# claude-docs-watch configuration. Bash syntax, sourced on every run.
+# Location: ~/.config/claude-docs-watch/config (mode 600).
+
+# Channels to notify: any of ntfy, slack, email, desktop. Empty tracks changes without notifying.
+CDW_NOTIFY=""
+
+# Document to track and the git repository that stores its history.
+#CDW_URL="https://code.claude.com/docs/llms-full.txt"
+#CDW_REPO_DIR="$HOME/.local/share/claude-docs-watch"
+#CDW_TITLE="Claude Code docs changed"
+
+# Directory inside the repository for one file per page plus index.md. Empty disables it.
+#CDW_DOCS_DIR="docs"
+
+# ntfy. A topic on ntfy.sh is readable and writable by anyone who knows its name.
+#CDW_NTFY_TOPIC="claude-docs-CHANGE-ME"
+#CDW_NTFY_URL="https://ntfy.sh"
+#CDW_NTFY_TOKEN="tk_..."
+#CDW_NTFY_USER=""
+#CDW_NTFY_PASSWORD=""
+#CDW_NTFY_PRIORITY="default"
+#CDW_NTFY_TAGS="books"
+
+# Slack incoming webhook.
+#CDW_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/XXXX"
+
+# Email. With CDW_SMTP_URL the message goes through curl, otherwise through sendmail.
+#CDW_EMAIL_TO="you@example.com"
+#CDW_EMAIL_FROM="claude-docs-watch@example.com"
+#CDW_SMTP_URL="smtps://smtp.example.com:465"
+#CDW_SMTP_USER=""
+#CDW_SMTP_PASSWORD=""
+#CDW_SMTP_STARTTLS=1
+#CDW_SENDMAIL="/usr/sbin/sendmail"
+#CDW_EMAIL_DIFF_LINES=200
+
+# Desktop: auto, terminal-notifier, osascript or notify-send.
+#CDW_DESKTOP_CMD="auto"

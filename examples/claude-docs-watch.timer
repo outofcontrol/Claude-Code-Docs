@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 OutofControl
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[Unit]
+Description=Check the Claude Code docs for changes every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
