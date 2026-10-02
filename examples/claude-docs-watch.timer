@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
 [Unit]
-Description=Check the Claude Code docs for changes every hour
+Description=Check the Claude Code docs for changes once a day
 
 [Timer]
-OnCalendar=hourly
+OnCalendar=*-*-* 09:00:00
 RandomizedDelaySec=300
 Persistent=true
 
