@@ -8,7 +8,8 @@
 set -Eeuo pipefail
 
 readonly PROGRAM="claude-docs-watch"
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
+readonly REPORT_MAX_BYTES=5242880
 
 QUIET=0
 CONFIG_FILE=""
@@ -16,6 +17,13 @@ WORK_DIR=""
 LOCK_DIR=""
 FAILURES=0
 CHANNELS=()
+REPORT_ALL=0
+REPORT_ARGS=()
+# Diff page published by this run, the file a desktop click opens, and the
+# file name an attached diff page gets.
+PUBLISHED_REPORT=""
+REPORT_OPEN=""
+REPORT_NAME="claude-docs-changes.html"
 
 usage() {
     cat <<EOF
@@ -24,6 +32,10 @@ Usage: $PROGRAM [options] [command]
 Commands:
   check         Fetch the document, commit changes, send notifications (default)
   test-notify   Send a test notification to every configured channel
+  report [FROM [TO]]
+                Write the diff page for a range of commits and print its path.
+                Default range: the latest recorded change.
+  report --all  Rebuild the diff page of every recorded change
 
 Options:
   -c, --config FILE   Read configuration from FILE
@@ -94,12 +106,15 @@ load_config() {
     : "${CDW_NOTIFY:=}"
     CDW_SECTION_PREFIX=${CDW_SECTION_PREFIX-Source: }
     CDW_DOCS_DIR=${CDW_DOCS_DIR-docs}
+    CDW_CHANGES_DIR=${CDW_CHANGES_DIR-changes}
     export CDW_SECTION_PREFIX
+    : "${CDW_EXCERPT_CHARS:=150}"
     : "${CDW_MAX_PAGES:=15}"
     : "${CDW_MIN_BYTES:=1024}"
     : "${CDW_TIMEOUT:=120}"
     : "${CDW_NTFY_URL:=https://ntfy.sh}"
     : "${CDW_NTFY_PRIORITY:=default}"
+    : "${CDW_NTFY_ATTACH:=1}"
     CDW_NTFY_TAGS=${CDW_NTFY_TAGS-books}
     : "${CDW_EMAIL_DIFF_LINES:=200}"
     : "${CDW_SMTP_STARTTLS:=1}"
@@ -111,7 +126,14 @@ load_config() {
     case $CDW_DOCS_DIR in
         */* | .* | -* | "$CDW_FILE") die "CDW_DOCS_DIR must be a plain directory name: $CDW_DOCS_DIR" 2 ;;
     esac
+    case $CDW_CHANGES_DIR in
+        "") ;;
+        */* | .* | -* | "$CDW_FILE" | "$CDW_DOCS_DIR")
+            die "CDW_CHANGES_DIR must be a plain directory name: $CDW_CHANGES_DIR" 2
+            ;;
+    esac
     require_number CDW_MAX_PAGES "$CDW_MAX_PAGES"
+    require_number CDW_EXCERPT_CHARS "$CDW_EXCERPT_CHARS"
     require_number CDW_MIN_BYTES "$CDW_MIN_BYTES"
     require_number CDW_TIMEOUT "$CDW_TIMEOUT"
     require_number CDW_EMAIL_DIFF_LINES "$CDW_EMAIL_DIFF_LINES"
@@ -212,24 +234,53 @@ slack_escape() {
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+html_escape() {
+    slack_escape | sed 's/"/\&quot;/g'
+}
+
+# Succeed when $1 is a diff page small enough to attach or embed.
+usable_report() {
+    [[ -n $1 && -f $1 ]] && (($(wc -c <"$1") <= REPORT_MAX_BYTES))
+}
+
 # ---------------------------------------------------------------------------
-# Notification channels. Arguments: title, body file, detail file (optional).
+# Notification channels. Arguments: title, body file, detail file (optional),
+# diff page (optional).
 # ---------------------------------------------------------------------------
 
+ntfy_options() {
+    curl_option url "${CDW_NTFY_URL%/}/$CDW_NTFY_TOPIC"
+    curl_option header "Title: $(encode_header "$1")"
+    curl_option header "Priority: $CDW_NTFY_PRIORITY"
+    [[ -z $CDW_NTFY_TAGS ]] || curl_option header "Tags: $CDW_NTFY_TAGS"
+    if [[ -n ${CDW_NTFY_TOKEN:-} ]]; then
+        curl_option header "Authorization: Bearer $CDW_NTFY_TOKEN"
+    elif [[ -n ${CDW_NTFY_USER:-} ]]; then
+        curl_option user "$CDW_NTFY_USER:${CDW_NTFY_PASSWORD:-}"
+    fi
+}
+
+# With a diff page the request uploads it as an attachment and carries the
+# text in the Message header, where ntfy reads "\n" as a line break. A server
+# that rejects attachments gets the text alone.
 send_ntfy() {
-    local title=$1 body_file=$2
+    local title=$1 body_file=$2 report=${4:-} message
+    if [[ $CDW_NTFY_ATTACH != 0 ]] && usable_report "$report"; then
+        message=$(awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }' "$body_file")
+        if {
+            ntfy_options "$title"
+            curl_option header "Filename: $REPORT_NAME"
+            curl_option header "Message: $(encode_header "$message")"
+        } | curl --silent --show-error --fail --max-time 60 --output /dev/null \
+            --upload-file "$report" --config -; then
+            return 0
+        fi
+        err "ntfy rejected the attachment, sending the text alone (CDW_NTFY_ATTACH=0 skips the attempt)"
+    fi
     {
-        curl_option url "${CDW_NTFY_URL%/}/$CDW_NTFY_TOPIC"
-        curl_option header "Title: $(encode_header "$title")"
-        curl_option header "Priority: $CDW_NTFY_PRIORITY"
-        [[ -z $CDW_NTFY_TAGS ]] || curl_option header "Tags: $CDW_NTFY_TAGS"
+        ntfy_options "$title"
         curl_option header "Click: $CDW_URL"
         curl_option header "Content-Type: text/plain; charset=utf-8"
-        if [[ -n ${CDW_NTFY_TOKEN:-} ]]; then
-            curl_option header "Authorization: Bearer $CDW_NTFY_TOKEN"
-        elif [[ -n ${CDW_NTFY_USER:-} ]]; then
-            curl_option user "$CDW_NTFY_USER:${CDW_NTFY_PASSWORD:-}"
-        fi
     } | curl --silent --show-error --fail --max-time 30 --output /dev/null \
         --data-binary "@$body_file" --config -
 }
@@ -252,8 +303,8 @@ send_slack() {
 }
 
 send_email() {
-    local title=$1 body_file=$2 detail_file=${3:-} message="$WORK_DIR/message.eml"
-    local from to recipient
+    local title=$1 body_file=$2 detail_file=${3:-} report=${4:-} message="$WORK_DIR/message.eml"
+    local from to recipient boundary="=_$PROGRAM-part"
     local -a recipients
     from=$(strip_newlines "$CDW_EMAIL_FROM")
     to=$(strip_newlines "$CDW_EMAIL_TO")
@@ -263,6 +314,11 @@ send_email() {
         printf 'Subject: %s\n' "$(encode_header "$title")"
         printf 'Date: %s\n' "$(LC_ALL=C date '+%a, %d %b %Y %H:%M:%S %z')"
         printf 'MIME-Version: 1.0\n'
+        if usable_report "$report"; then
+            printf 'Content-Type: multipart/alternative; boundary="%s"\n\n--%s\n' "$boundary" "$boundary"
+        else
+            report=""
+        fi
         printf 'Content-Type: text/plain; charset=UTF-8\n'
         printf 'Content-Transfer-Encoding: base64\n\n'
         {
@@ -273,6 +329,13 @@ send_email() {
             fi
         } | base64 | tr -d '\r\n' | fold -w 76
         printf '\n'
+        if [[ -n $report ]]; then
+            printf -- '--%s\n' "$boundary"
+            printf 'Content-Type: text/html; charset=UTF-8\n'
+            printf 'Content-Transfer-Encoding: base64\n\n'
+            base64 <"$report" | tr -d '\r\n' | fold -w 76
+            printf '\n--%s--\n' "$boundary"
+        fi
     } >"$message"
 
     if [[ -z ${CDW_SMTP_URL:-} ]]; then
@@ -294,12 +357,13 @@ send_email() {
 }
 
 send_desktop() {
-    local title=$1 body_file=$2 backend text
+    local title=$1 body_file=$2 backend text target=$CDW_URL
     backend=$(desktop_backend) || return 1
     text=$(head -n 4 "$body_file")
+    [[ -z $REPORT_OPEN ]] || target="file://${REPORT_OPEN// /%20}"
     case $backend in
         terminal-notifier)
-            terminal-notifier -title "$title" -message "$text" -group "$PROGRAM" -open "$CDW_URL" >/dev/null
+            terminal-notifier -title "$title" -message "$text" -group "$PROGRAM" -open "$target" >/dev/null
             ;;
         osascript)
             osascript -e 'on run argv' \
@@ -327,11 +391,20 @@ repo_git() {
         "$@"
 }
 
+# Append line $2 to file $1 unless the file has it.
+ensure_line() {
+    grep -qxF -- "$2" "$1" 2>/dev/null || printf '%s\n' "$2" >>"$1"
+}
+
 ensure_repo() {
-    [[ -d $CDW_REPO_DIR/.git ]] && return 0
-    mkdir -p "$CDW_REPO_DIR"
-    git init -q "$CDW_REPO_DIR"
-    repo_git symbolic-ref HEAD refs/heads/main
+    if [[ ! -d $CDW_REPO_DIR/.git ]]; then
+        mkdir -p "$CDW_REPO_DIR"
+        git init -q "$CDW_REPO_DIR"
+        repo_git symbolic-ref HEAD refs/heads/main
+    fi
+    mkdir -p "$CDW_REPO_DIR/.git/info"
+    # Diff pages are derived from the history and stay out of it.
+    [[ -z $CDW_CHANGES_DIR ]] || ensure_line "$CDW_REPO_DIR/.git/info/exclude" "/$CDW_CHANGES_DIR/"
 }
 
 acquire_lock() {
@@ -428,15 +501,16 @@ page_manifest() {
 # Write the pages listed in manifest $1 from document $2 into directory $3.
 # Links to another page become relative file links. Other links that start
 # with "/" get the origin of the page URL. Trailing blank lines are dropped.
+# With $4 set the links stay as they are.
 write_pages() {
     local manifest=$1 document=$2 out_dir=$3 dir
     mkdir -p "$out_dir"
     cut -f2 "$manifest" | sed -n 's|/[^/]*$||p' | LC_ALL=C sort -u | while IFS= read -r dir; do
         mkdir -p "$out_dir/$dir"
     done
-    CDW_PAGES_OUT=$out_dir LC_ALL=C awk -F'\t' '
+    CDW_PAGES_OUT=$out_dir CDW_PAGES_RAW="${4:-}" LC_ALL=C awk -F'\t' '
         function rewrite(line,    out, lead, link, key, anchor, hash, fresh) {
-            if (index(line, "](/") == 0 && index(line, "href=\"/") == 0) return line
+            if (raw != "" || (index(line, "](/") == 0 && index(line, "href=\"/") == 0)) return line
             out = ""
             while (match(line, /(\]\(|href=")\/[^)" \t]*/)) {
                 lead = substr(line, RSTART, 2) == "](" ? "](" : "href=\""
@@ -454,7 +528,7 @@ write_pages() {
             }
             return out line
         }
-        BEGIN { out_dir = ENVIRON["CDW_PAGES_OUT"] }
+        BEGIN { out_dir = ENVIRON["CDW_PAGES_OUT"]; raw = ENVIRON["CDW_PAGES_RAW"] }
         pass == 1 {
             start[$1] = $2
             site = $3
@@ -486,7 +560,7 @@ write_pages() {
 # Write the root page for manifest $1 to file $2: one link per page, grouped
 # by directory.
 write_index() {
-    CDW_URL="$CDW_URL" LC_ALL=C awk -F'\t' '
+    CDW_URL="$CDW_URL" CDW_CHANGES_DIR="$CDW_CHANGES_DIR" LC_ALL=C awk -F'\t' '
         function escaped(text,    out, i, c) {
             out = ""
             for (i = 1; i <= length(text); i++) {
@@ -503,6 +577,8 @@ write_index() {
         }
         END {
             printf "# Documentation index\n\n%d pages from <%s>.\n", NR, ENVIRON["CDW_URL"]
+            if (ENVIRON["CDW_CHANGES_DIR"] != "")
+                printf "\n[Change history](../%s/index.html)\n", ENVIRON["CDW_CHANGES_DIR"]
             for (i = 1; i <= groups; i++)
                 printf "\n## %s\n\n%s", (order[i] == "" ? "Pages" : order[i]), items[order[i]]
         }
@@ -569,14 +645,130 @@ touched_sections() {
     ' "$1" "$2"
 }
 
-# Write a notification body and an email detail file for the range $1..$2.
+# Print a unified diff on stdin as tab separated rows:
+#   F status path             file, status M (changed), A (new) or D (removed)
+#   H heading                 hunk, with the Markdown heading above it
+#   C text                    unchanged line
+#   D before changed after paired    removed line
+#   A before changed after paired    added line
+# A removed line and the added line that replaces it are paired: the text they
+# share at both ends goes to "before" and "after", cut between words, and
+# "paired" is 1. Lines that share less than 30 percent stay whole in "before".
+# Removed files carry no lines. Tabs in the text become four spaces. With $1
+# set, the first directory of every path is dropped.
+diff_rows() {
+    CDW_STRIP_DIR="${1:-}" LC_ALL=C awk '
+        function count(range,    comma) {
+            comma = index(range, ",")
+            return comma ? substr(range, comma + 1) + 0 : 1
+        }
+        # A cut after p characters sits between words: at a space, or at
+        # the end of one line while the other continues with a space.
+        function boundary(text, len, p) {
+            return p == 0 || p == len || substr(text, p, 1) == " " || substr(text, p + 1, 1) == " "
+        }
+        function pair(i,    old, new, lo, ln, min, p, s) {
+            old = dels[i]; new = adds[i]
+            lo = length(old); ln = length(new); min = lo < ln ? lo : ln
+            p = 0
+            while (p < min && substr(old, p + 1, 1) == substr(new, p + 1, 1)) p++
+            while (!(boundary(old, lo, p) && boundary(new, ln, p))) p--
+            s = 0
+            while (s < min - p && substr(old, lo - s, 1) == substr(new, ln - s, 1)) s++
+            while (!(boundary(old, lo, lo - s) && boundary(new, ln, ln - s))) s--
+            paired[i] = p + s > 0 && (p + s) * 10 >= min * 3
+            before[i] = p; after[i] = s
+        }
+        function row(kind, text, i,    len) {
+            if (status == "D") return
+            if (!i || !paired[i]) { printf "%s\t%s\t\t\t0\n", kind, text; return }
+            len = length(text)
+            printf "%s\t%s\t%s\t%s\t1\n", kind, substr(text, 1, before[i]), \
+                substr(text, before[i] + 1, len - before[i] - after[i]), substr(text, len - after[i] + 1)
+        }
+        function flush(    i) {
+            for (i = 1; i <= nd && i <= na; i++) pair(i)
+            for (i = 1; i <= nd; i++) row("D", dels[i], i <= na ? i : 0)
+            for (i = 1; i <= na; i++) row("A", adds[i], i <= nd ? i : 0)
+            nd = 0; na = 0
+        }
+        oldleft > 0 || newleft > 0 {
+            mark = substr($0, 1, 1)
+            text = substr($0, 2)
+            gsub(/\t/, "    ", text)
+            sub(/\r$/, "", text)
+            if (mark == "-") { oldleft--; if (na > 0) flush(); dels[++nd] = text }
+            else if (mark == "+") { newleft--; adds[++na] = text }
+            else if (mark != "\\") { oldleft--; newleft--; flush(); row("C", text, 0) }
+            if (oldleft <= 0 && newleft <= 0) flush()
+            next
+        }
+        /^diff --git / {
+            rest = substr($0, 14)
+            path = substr(rest, 1, (length(rest) - 3) / 2)
+            if (ENVIRON["CDW_STRIP_DIR"] != "") sub(/^[^\/]*\//, "", path)
+            status = "M"; announced = 0
+            next
+        }
+        /^new file mode / { status = "A"; next }
+        /^deleted file mode / { status = "D"; next }
+        /^@@ / {
+            if (!announced) { printf "F\t%s\t%s\n", status, path; announced = 1 }
+            oldleft = count($2); newleft = count($3)
+            heading = substr($0, index(substr($0, 4), " @@") + 7)
+            gsub(/\t/, " ", heading)
+            if (status == "M") printf "H\t%s\n", heading
+            next
+        }
+    '
+}
+
+# Print "path<TAB>sign<TAB>text" for the first added and the first removed text
+# of every changed file in the rows on stdin, cut to CDW_EXCERPT_CHARS.
+page_excerpts() {
+    CDW_EXCERPT_CHARS="$CDW_EXCERPT_CHARS" LC_ALL=C awk -F'\t' '
+        BEGIN { limit = ENVIRON["CDW_EXCERPT_CHARS"] + 0 }
+        $1 == "F" { path = $3; status = $2; seen["A"] = 0; seen["D"] = 0; next }
+        status == "M" && ($1 == "A" || $1 == "D") && !seen[$1] {
+            if ($5 == 1) {
+                if ($3 ~ /^ *$/) next
+                lead = $2
+                if (length(lead) > 40) {
+                    lead = substr(lead, length(lead) - 39)
+                    lead = "..." substr(lead, index(lead, " ") + 1)
+                }
+                text = lead $3 $4
+            } else text = $2
+            gsub(/  +/, " ", text)
+            sub(/^ /, "", text)
+            sub(/ $/, "", text)
+            if (text == "") next
+            if (length(text) > limit) {
+                text = substr(text, 1, limit)
+                sub(/ [^ ]*$/, "", text)
+                text = text "..."
+            }
+            seen[$1] = 1
+            printf "%s\t%s\t%s\n", path, ($1 == "A" ? "+" : "-"), text
+        }
+    '
+}
+
+# Write for the range $1..$2, under the path prefix $3: .body (notification
+# text), .detail (plain text for email), .counts (one line) and, with
+# CDW_CHANGES_DIR set, .html (diff page).
 build_summary() {
-    local from=$1 to=$2 body_file=$3 detail_file=$4
-    local tmp="$WORK_DIR/summary" added=0 removed=0 total shown
-    local pages_changed pages_added pages_removed
+    local from=$1 to=$2 prefix=$3
+    local tmp="$WORK_DIR/summary" added=0 removed=0 total counts
+    local -a diff_options=(-U2 --no-color --no-ext-diff --no-textconv --no-renames --src-prefix=a/ --dst-prefix=b/)
     mkdir -p "$tmp"
+    : >"$tmp/list"
+    : >"$tmp/old.manifest"
+    : >"$tmp/new.manifest"
+    : >"$tmp/excerpts"
 
     read -r added removed _ <<<"$(repo_git diff --numstat "$from" "$to" -- "$CDW_FILE")" || true
+    counts="Lines: +$added -$removed."
 
     if [[ -n $CDW_SECTION_PREFIX ]]; then
         repo_git show "$from:$CDW_FILE" >"$tmp/old"
@@ -600,20 +792,60 @@ build_summary() {
             sed 's/^/+ /' "$tmp/added"
             sed 's/^/- /' "$tmp/removed"
         } >"$tmp/list"
-        pages_changed=$(wc -l <"$tmp/changed" | tr -d ' ')
-        pages_added=$(wc -l <"$tmp/added" | tr -d ' ')
-        pages_removed=$(wc -l <"$tmp/removed" | tr -d ' ')
-        total=$((pages_changed + pages_added + pages_removed))
-        shown=$((total < CDW_MAX_PAGES ? total : CDW_MAX_PAGES))
-        {
-            printf 'Pages: %s changed, %s added, %s removed. Lines: +%s -%s.\n' \
-                "$pages_changed" "$pages_added" "$pages_removed" "$added" "$removed"
-            head -n "$shown" "$tmp/list"
-            ((total <= shown)) || printf '(and %s more)\n' "$((total - shown))"
-        } >"$body_file"
-    else
-        printf 'Lines: +%s -%s.\n' "$added" "$removed" >"$body_file"
+        counts="Pages: $(wc -l <"$tmp/changed" | tr -d ' ') changed, $(wc -l <"$tmp/added" | tr -d ' ') added, $(wc -l <"$tmp/removed" | tr -d ' ') removed. $counts"
+        page_manifest "$tmp/new" >"$tmp/new.manifest"
+        page_manifest "$tmp/old" >"$tmp/old.manifest"
     fi
+    printf '%s\n' "$counts" >"$prefix.counts"
+
+    # The diff compares each page as it stands in the document. The page
+    # files in the repository would add noise: a link in an unchanged page is
+    # rewritten when the page it points to appears or disappears.
+    if [[ -s $tmp/new.manifest || -s $tmp/old.manifest ]]; then
+        rm -rf "$tmp/a" "$tmp/b"
+        write_pages "$tmp/old.manifest" "$tmp/old" "$tmp/a" raw
+        write_pages "$tmp/new.manifest" "$tmp/new" "$tmp/b" raw
+        git -C "$tmp" -c 'diff.default.xfuncname=^#{1,6}[[:space:]].*$' diff --no-index "${diff_options[@]}" a b \
+            >"$tmp/pages.diff" || [[ $? -eq 1 ]]
+        diff_rows strip <"$tmp/pages.diff" >"$tmp/rows"
+        ((CDW_EXCERPT_CHARS == 0)) || page_excerpts <"$tmp/rows" >"$tmp/excerpts"
+    else
+        repo_git diff "${diff_options[@]}" "$from" "$to" -- "$CDW_FILE" | diff_rows >"$tmp/rows"
+    fi
+
+    # A page known to the manifest is listed by its file path with its
+    # excerpts, any other entry as it is. The list stops at CDW_MAX_PAGES
+    # entries or 3000 bytes: ntfy turns longer messages into attachments.
+    {
+        cat "$prefix.counts"
+        CDW_MAX_PAGES="$CDW_MAX_PAGES" LC_ALL=C awk -F'\t' '
+            BEGIN { limit = ENVIRON["CDW_MAX_PAGES"] + 0 }
+            kind == "manifest" { if (!($3 in file)) file[$3] = $2; next }
+            kind == "excerpt" {
+                if ($2 == "+") gained[$1] = "  + " $3 "\n"
+                else lost[$1] = "  - " $3 "\n"
+                next
+            }
+            {
+                total++
+                sign = substr($0, 1, 1)
+                name = substr($0, 3)
+                block = $0 "\n"
+                if (name in file) {
+                    path = file[name]
+                    name = path
+                    sub(/\.md$/, "", name)
+                    block = sign " " name (sign == "+" ? " (new page)" : sign == "-" ? " (removed)" : "") "\n" gained[path] lost[path]
+                }
+                if (!full && shown < limit && bytes + length(block) <= 3000) {
+                    printf "%s", block
+                    shown++
+                    bytes += length(block)
+                } else full = 1
+            }
+            END { if (total > shown) printf "(and %d more)\n", total - shown }
+        ' kind=manifest "$tmp/new.manifest" "$tmp/old.manifest" kind=excerpt "$tmp/excerpts" kind=list "$tmp/list"
+    } >"$prefix.body"
 
     {
         printf 'Document: %s\n' "$CDW_URL"
@@ -628,7 +860,207 @@ build_summary() {
             ((total <= CDW_EMAIL_DIFF_LINES)) ||
                 printf '\n[diff truncated: %s of %s lines shown]\n' "$CDW_EMAIL_DIFF_LINES" "$total"
         fi
-    } >"$detail_file"
+    } >"$prefix.detail"
+
+    [[ -z $CDW_CHANGES_DIR ]] || build_report "$from" "$to" "$tmp" "$prefix.html"
+}
+
+# ---------------------------------------------------------------------------
+# Diff pages
+# ---------------------------------------------------------------------------
+
+# Print the start of an HTML page with title $1. $2 goes into the
+# cdw-summary meta element, which the history page reads back.
+report_head() {
+    cat <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="cdw-summary" content="$(printf '%s' "$2" | html_escape)">
+<title>$(printf '%s' "$1" | html_escape)</title>
+<style>
+body{margin:0 auto;max-width:1100px;padding:16px;background:#fff;color:#1f2328;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+a{color:#0969da}
+h1{font-size:22px;margin:0 0 4px}
+.meta{color:#59636e;margin:0 0 12px}
+.toc{padding-left:20px}
+.file{border:1px solid #d1d9e0;border-radius:6px;margin:16px 0;overflow:hidden}
+.file h2{background:#f6f8fa;border-bottom:1px solid #d1d9e0;font-size:14px;margin:0;padding:8px 12px}
+.file h2 a{font-weight:400;margin-left:8px}
+.tag{border:1px solid #d1d9e0;border-radius:10px;font-size:12px;font-weight:400;margin-right:8px;padding:0 8px}
+table{border-collapse:collapse;width:100%;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+td{padding:1px 8px;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}
+td.g{color:#59636e;text-align:center;user-select:none;width:1ch}
+tr.add td{background:#dafbe1}
+tr.del td{background:#ffebe9}
+tr.hunk td{background:#ddf4ff;color:#59636e}
+ins{background:#aceebb;text-decoration:none}
+del{background:#ffcecb;text-decoration:none}
+.gap{color:#59636e}
+.note,details{margin:0;padding:8px 12px}
+summary{cursor:pointer}
+table.history{font:inherit}
+table.history td{border-bottom:1px solid #d1d9e0;padding:6px 12px 6px 0;white-space:normal}
+@media (prefers-color-scheme:dark){
+body{background:#0d1117;color:#f0f6fc}
+a{color:#4493f8}
+.meta,.gap,td.g{color:#9198a1}
+.file,.file h2,.tag,table.history td{border-color:#3d444d}
+.file h2{background:#151b23}
+tr.add td{background:#12261e}
+tr.del td{background:#2d1214}
+tr.hunk td{background:#121d2f;color:#9198a1}
+ins{background:#1f6f3a;color:inherit}
+del{background:#8e1519;color:inherit}
+}
+</style>
+</head>
+<body>
+EOF
+}
+
+# Print the cdw-summary of diff page $1: "sequence|date|range|counts".
+report_summary() {
+    sed -n '/^<meta name="cdw-summary" content="/{s///;s/">$//p;q;}' "$1"
+}
+
+# Write the diff page for the range $1..$2 to file $4 from the rows, manifests
+# and counts that build_summary left in directory $3.
+build_report() {
+    local from=$1 to=$2 tmp=$3 out=$4 when range
+    when=$(repo_git log -1 --format=%cd --date=format:'%Y-%m-%d %H:%M' "$to")
+    range="$(repo_git rev-parse --short "$from")..$(repo_git rev-parse --short "$to")"
+    {
+        report_head "$CDW_TITLE, $when" "$(repo_git rev-list --count "$to")|$when|$range|$(cat "${out%.html}.counts")"
+        printf '<h1>%s</h1>\n' "$(printf '%s' "$CDW_TITLE" | html_escape)"
+        printf '<p class="meta">%s &middot; %s &middot; %s</p>\n' "$when" "$range" "$(html_escape <"${out%.html}.counts")"
+        printf '<p class="meta"><a href="index.html">History</a>'
+        [[ -z $CDW_DOCS_DIR ]] || printf ' &middot; <a href="../%s/index.md">All pages</a>' "$CDW_DOCS_DIR"
+        printf '</p>\n'
+        CDW_DOCS_DIR="$CDW_DOCS_DIR" LC_ALL=C awk -F'\t' '
+            function esc(text) {
+                gsub(/&/, "\\&amp;", text)
+                gsub(/</, "\\&lt;", text)
+                gsub(/>/, "\\&gt;", text)
+                gsub(/"/, "\\&quot;", text)
+                return text
+            }
+            # Long unchanged text keeps its first and last 150 characters.
+            function elide(text,    first, last) {
+                if (length(text) <= 400) return esc(text)
+                first = substr(text, 1, 150)
+                sub(/ [^ ]*$/, "", first)
+                last = substr(text, length(text) - 149)
+                last = substr(last, index(last, " ") + 1)
+                return esc(first) "<span class=\"gap\"> &hellip; </span>" esc(last)
+            }
+            function cell(text) { return text == "" ? "<br>" : text }
+            function word(status) { return status == "A" ? "new" : status == "D" ? "removed" : "changed" }
+            function contents(    i, name) {
+                started = 1
+                if (files == 0) { print "<p class=\"note\">No page content changed.</p>"; return }
+                print "<ul class=\"toc\">"
+                for (i = 1; i <= files; i++) {
+                    name = paths[i]
+                    sub(/\.md$/, "", name)
+                    printf "<li><a href=\"#p%d\">%s</a> <span class=\"meta\">%s</span></li>\n", i, esc(name), word(statuses[i])
+                }
+                print "</ul>"
+            }
+            function finish() {
+                if (state == "table") print "</table>"
+                if (folded) print "</details>"
+                if (state != "") print "</section>"
+                state = ""; folded = 0
+            }
+            BEGIN { docs = ENVIRON["CDW_DOCS_DIR"] }
+            kind == "manifest" { if (!($2 in title)) { title[$2] = $4; url[$2] = $3 } next }
+            kind == "scan" {
+                if ($1 == "F") { files++; statuses[files] = $2; paths[files] = $3 }
+                else if ($1 == "A") added[files]++
+                next
+            }
+            !started { contents() }
+            $1 == "F" {
+                finish()
+                n++
+                name = $3
+                printf "<section class=\"file\" id=\"p%d\">\n<h2><span class=\"tag\">%s</span>%s", n, word($2), esc(name in title ? title[name] : name)
+                if ($2 != "D" && docs != "" && name in title) printf " <a href=\"../%s/%s\">%s</a>", esc(docs), esc(name), esc(name)
+                if (name in url) printf " <a href=\"%s\">live page</a>", esc(url[name])
+                print "</h2>"
+                state = "section"
+                if ($2 == "D") print "<p class=\"note\">Page removed.</p>"
+                if ($2 == "A") { printf "<details><summary>Show the new page (%d lines)</summary>\n", added[n]; folded = 1 }
+                next
+            }
+            state == "section" { print "<table>"; state = "table" }
+            $1 == "H" { printf "<tr class=\"hunk\"><td class=\"g\"></td><td>@@%s</td></tr>\n", ($2 == "" ? "" : " " esc($2)); next }
+            $1 == "C" { printf "<tr><td class=\"g\"></td><td>%s</td></tr>\n", cell(elide($2)); next }
+            {
+                tag = $1 == "A" ? "ins" : "del"
+                if ($5 == 1) text = elide($2) ($3 == "" ? "" : "<" tag ">" esc($3) "</" tag ">") elide($4)
+                else text = esc($2)
+                printf "<tr class=\"%s\"><td class=\"g\">%s</td><td>%s</td></tr>\n", ($1 == "A" ? "add" : "del"), ($1 == "A" ? "+" : "-"), cell(text)
+            }
+            END { if (!started) contents(); finish() }
+        ' kind=manifest "$tmp/new.manifest" "$tmp/old.manifest" kind=scan "$tmp/rows" kind=emit "$tmp/rows"
+        printf '</body>\n</html>\n'
+    } >"$out"
+}
+
+# Rebuild the history page from the diff pages in the changes directory,
+# newest first, and copy the newest diff page to latest.html.
+write_changes_index() {
+    local dir="$CDW_REPO_DIR/$CDW_CHANGES_DIR" list="$WORK_DIR/changes.list" file summary newest
+    mkdir -p "$dir"
+    for file in "$dir"/*-claude-docs-changes*.html; do
+        [[ -e $file ]] || continue
+        summary=$(report_summary "$file")
+        [[ -z $summary ]] || printf '%s|%s\n' "$summary" "${file##*/}"
+    done | LC_ALL=C sort -t'|' -k1,1nr >"$list"
+    newest=$(awk -F'|' 'NR == 1 { print $NF }' "$list")
+    if [[ -n $newest ]]; then
+        cp "$dir/$newest" "$dir/latest.html"
+    else
+        rm -f "$dir/latest.html"
+    fi
+    {
+        report_head "$CDW_TITLE: history" ""
+        printf '<h1>%s</h1>\n' "$(printf '%s: history' "$CDW_TITLE" | html_escape)"
+        printf '<p class="meta"><a href="latest.html">Latest change</a>'
+        [[ -z $CDW_DOCS_DIR ]] || printf ' &middot; <a href="../%s/index.md">All pages</a>' "$CDW_DOCS_DIR"
+        printf '</p>\n'
+        if [[ -s $list ]]; then
+            printf '<table class="history">\n'
+            awk -F'|' '{ printf "<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td class=\"meta\">%s</td></tr>\n", $5, $2, $4, $3 }' "$list"
+            printf '</table>\n'
+        else
+            printf '<p class="note">No changes recorded yet.</p>\n'
+        fi
+        printf '</body>\n</html>\n'
+    } >"$dir/index.html"
+}
+
+# Copy diff page $3 for the range $1..$2 into the changes directory under a
+# dated name, refresh the history page and print the path of the copy. A name
+# taken by another range gets a numeric suffix.
+publish_report() {
+    local from=$1 to=$2 page=$3 dir="$CDW_REPO_DIR/$CDW_CHANGES_DIR" stamp range name copy=1
+    mkdir -p "$dir"
+    stamp=$(repo_git log -1 --format=%cd --date=format:'%Y-%m-%d-%H%M' "$to")
+    range="$(repo_git rev-parse --short "$from")..$(repo_git rev-parse --short "$to")"
+    name="$stamp-claude-docs-changes.html"
+    while [[ -e $dir/$name && $(report_summary "$dir/$name") != *"|$range|"* ]]; do
+        copy=$((copy + 1))
+        name="$stamp-claude-docs-changes-$copy.html"
+    done
+    cp "$page" "$dir/$name"
+    write_changes_index
+    printf '%s\n' "$dir/$name"
 }
 
 # Each channel has a ref pointing at the last commit it announced. A failed
@@ -636,7 +1068,7 @@ build_summary() {
 # channels that succeeded. $1 is HEAD before this run, empty on the first run.
 # Failed sends are counted in FAILURES.
 notify_pending() {
-    local previous_head=$1 head channel ref last body detail
+    local previous_head=$1 head channel ref last base report
     ((${#CHANNELS[@]})) || return 0
     head=$(repo_git rev-parse HEAD)
     for channel in "${CHANNELS[@]}"; do
@@ -645,10 +1077,23 @@ notify_pending() {
         : "${last:=${previous_head:-$head}}"
         # A commit that only rebuilds the page files is not announced.
         if [[ $last != "$head" ]] && ! repo_git diff --quiet "$last" "$head" -- "$CDW_FILE"; then
-            body="$WORK_DIR/$last.body"
-            detail="$WORK_DIR/$last.detail"
-            [[ -f $body ]] || build_summary "$last" "$head" "$body" "$detail"
-            if ! "send_$channel" "$CDW_TITLE" "$body" "$detail"; then
+            base="$WORK_DIR/$last"
+            [[ -f $base.body ]] || build_summary "$last" "$head" "$base"
+            report=""
+            REPORT_OPEN=""
+            REPORT_NAME="claude-docs-changes.html"
+            if [[ -f $base.html ]]; then
+                report=$base.html
+                # A channel that is behind covers a range without a published
+                # page: its click opens the history.
+                if [[ $last == "$previous_head" && -n $PUBLISHED_REPORT ]]; then
+                    REPORT_OPEN=$PUBLISHED_REPORT
+                    REPORT_NAME=${PUBLISHED_REPORT##*/}
+                else
+                    REPORT_OPEN="$CDW_REPO_DIR/$CDW_CHANGES_DIR/index.html"
+                fi
+            fi
+            if ! "send_$channel" "$CDW_TITLE" "$base.body" "$base.detail" "$report"; then
                 err "notification failed: $channel"
                 FAILURES=$((FAILURES + 1))
                 continue
@@ -664,27 +1109,93 @@ notify_pending() {
 # ---------------------------------------------------------------------------
 
 cmd_check() {
-    local fetched="$WORK_DIR/fetched" previous_head
+    local fetched="$WORK_DIR/fetched" previous_head head
     ensure_repo
     acquire_lock
     fetch_document "$fetched" || die "fetch failed: $CDW_URL"
     previous_head=$(repo_git rev-parse --verify -q HEAD || true)
     record_document "$fetched"
+    head=$(repo_git rev-parse HEAD)
+    if [[ -n $CDW_CHANGES_DIR ]]; then
+        if [[ -n $previous_head ]] && ! repo_git diff --quiet "$previous_head" "$head" -- "$CDW_FILE"; then
+            build_summary "$previous_head" "$head" "$WORK_DIR/$previous_head"
+            PUBLISHED_REPORT=$(publish_report "$previous_head" "$head" "$WORK_DIR/$previous_head.html")
+            log "Diff page: $PUBLISHED_REPORT"
+        elif [[ ! -e $CDW_REPO_DIR/$CDW_CHANGES_DIR/index.html ]]; then
+            write_changes_index
+        fi
+    fi
     notify_pending "$previous_head"
 }
 
 cmd_test_notify() {
-    local channel body="$WORK_DIR/test.body"
+    local channel body="$WORK_DIR/test.body" report="$WORK_DIR/test.html"
     ((${#CHANNELS[@]})) || die "no notification channels configured (CDW_NOTIFY)" 2
     printf 'Test notification from %s on %s.\n' "$PROGRAM" "$(uname -n)" >"$body"
+    {
+        report_head "$CDW_TITLE (test)" ""
+        printf '<h1>%s</h1>\n<p class="meta">%s</p>\n' "$(printf '%s (test)' "$CDW_TITLE" | html_escape)" "$(html_escape <"$body")"
+        printf '<section class="file"><h2><span class="tag">changed</span>Sample page</h2>\n<table>\n'
+        printf '<tr class="hunk"><td class="g"></td><td>@@ ## Sample heading</td></tr>\n'
+        printf '<tr class="del"><td class="g">-</td><td>A line with <del>old</del> words.</td></tr>\n'
+        printf '<tr class="add"><td class="g">+</td><td>A line with <ins>new</ins> words.</td></tr>\n'
+        printf '</table>\n</section>\n</body>\n</html>\n'
+    } >"$report"
+    REPORT_NAME="claude-docs-changes-test.html"
     for channel in "${CHANNELS[@]}"; do
-        if "send_$channel" "$CDW_TITLE (test)" "$body" ""; then
+        if "send_$channel" "$CDW_TITLE (test)" "$body" "" "$report"; then
             log "Test notification sent via $channel."
         else
             err "notification failed: $channel"
             FAILURES=$((FAILURES + 1))
         fi
     done
+}
+
+# Resolve revision $1 to a commit or exit 2.
+resolve_commit() {
+    repo_git rev-parse --verify -q "$1^{commit}" || die "unknown revision: $1" 2
+}
+
+cmd_report() {
+    local from to previous commit
+    [[ -n $CDW_CHANGES_DIR ]] || die "diff pages are disabled (CDW_CHANGES_DIR is empty)" 2
+    [[ -d $CDW_REPO_DIR/.git ]] || die "no repository in $CDW_REPO_DIR: run check first" 2
+    ensure_repo
+    acquire_lock
+
+    if ((REPORT_ALL)); then
+        rm -f -- "$CDW_REPO_DIR/$CDW_CHANGES_DIR"/*-claude-docs-changes*.html
+        previous=""
+        while IFS= read -r commit; do
+            if [[ -n $previous ]]; then
+                build_summary "$previous" "$commit" "$WORK_DIR/$previous"
+                publish_report "$previous" "$commit" "$WORK_DIR/$previous.html"
+            fi
+            previous=$commit
+        done < <(repo_git rev-list --reverse HEAD -- "$CDW_FILE")
+        write_changes_index
+        return 0
+    fi
+
+    case ${#REPORT_ARGS[@]} in
+        0)
+            to=$(repo_git log -1 --format=%H -- "$CDW_FILE")
+            from=$(repo_git log -1 --skip=1 --format=%H -- "$CDW_FILE")
+            [[ -n $from ]] || die "no change recorded yet"
+            ;;
+        1)
+            from=$(resolve_commit "${REPORT_ARGS[0]}")
+            to=$(resolve_commit HEAD)
+            ;;
+        2)
+            from=$(resolve_commit "${REPORT_ARGS[0]}")
+            to=$(resolve_commit "${REPORT_ARGS[1]}")
+            ;;
+        *) die "report takes at most two revisions" 2 ;;
+    esac
+    build_summary "$from" "$to" "$WORK_DIR/$from"
+    publish_report "$from" "$to" "$WORK_DIR/$from.html"
 }
 
 main() {
@@ -708,16 +1219,29 @@ main() {
                 printf '%s %s\n' "$PROGRAM" "$VERSION"
                 exit 0
                 ;;
-            check | test-notify)
+            check | test-notify | report)
                 command=$1
                 shift
                 ;;
-            *)
+            --all)
+                REPORT_ALL=1
+                shift
+                ;;
+            -*)
                 usage >&2
                 die "unknown argument: $1" 2
                 ;;
+            *)
+                if [[ $command != report ]]; then
+                    usage >&2
+                    die "unknown argument: $1" 2
+                fi
+                REPORT_ARGS+=("$1")
+                shift
+                ;;
         esac
     done
+    [[ $command == report || $REPORT_ALL == 0 ]] || die "--all belongs to the report command" 2
 
     for dependency in git curl; do
         command -v "$dependency" >/dev/null 2>&1 || die "missing dependency: $dependency" 2
@@ -733,6 +1257,7 @@ main() {
     case $command in
         check) cmd_check ;;
         test-notify) cmd_test_notify ;;
+        report) cmd_report ;;
     esac
     ((FAILURES == 0)) || exit 1
 }

@@ -9,8 +9,9 @@ Notification channels: [ntfy](https://ntfy.sh) (public or self hosted), Slack, e
 1. `curl` downloads the document.
 2. The document is split into one Markdown file per page under `docs/`, with a root page at `docs/index.md` that links to every page.
 3. A changed document is committed, with its page files, to a git repository in `~/.local/share/claude-docs-watch`.
-4. Every configured channel receives a summary: the pages changed, added and removed, and the line counts. Email also carries the start of the diff.
-5. A git ref per channel (`refs/claude-docs-watch/notified/<channel>`) records the last commit that channel announced. A channel that fails is retried on the next run with a summary of every change since its last delivery. Channels that succeeded are not notified again.
+4. A dated HTML diff page for the change is written to `changes/`, with a history page at `changes/index.html`.
+5. Every configured channel receives a summary: the pages changed, added and removed, the line counts, and a short excerpt of the added and removed text per page. The diff page travels with it where the channel allows.
+6. A git ref per channel (`refs/claude-docs-watch/notified/<channel>`) records the last commit that channel announced. A channel that fails is retried on the next run with a summary of every change since its last delivery. Channels that succeeded are not notified again.
 
 The first run records a baseline and sends nothing.
 
@@ -19,9 +20,12 @@ Example notification:
 ```text
 Claude Code docs changed
 Pages: 2 changed, 1 added, 0 removed. Lines: +41 -12.
-* https://code.claude.com/docs/en/hooks
-* https://code.claude.com/docs/en/settings
-+ https://code.claude.com/docs/en/brand-new
+* en/hooks
+  + ...command hooks accept an `async` field with a timeout in seconds. Hooks that exceed it are...
+  - ...command hooks run without a timeout.
+* en/settings
+  + `cleanupPeriodDays` defaults to 30.
++ en/brand-new (new page)
 ```
 
 ## Requirements
@@ -72,7 +76,9 @@ CDW_NOTIFY="ntfy,desktop"
 | `CDW_TITLE` | `Claude Code docs changed` | Notification title. |
 | `CDW_SECTION_PREFIX` | `Source: ` | Line prefix that starts a page. Empty reports line counts only and disables the page files. |
 | `CDW_DOCS_DIR` | `docs` | Directory inside the repository for the page files. Empty disables them. |
-| `CDW_MAX_PAGES` | `15` | Maximum number of pages listed in a notification. |
+| `CDW_CHANGES_DIR` | `changes` | Directory inside the repository for the diff pages. Empty disables them. |
+| `CDW_MAX_PAGES` | `15` | Maximum number of pages listed in a notification. The list also stops at 3000 bytes. |
+| `CDW_EXCERPT_CHARS` | `150` | Maximum length of an excerpt. `0` lists the pages without excerpts. |
 | `CDW_MIN_BYTES` | `1024` | Smaller responses are rejected as failed downloads. |
 | `CDW_TIMEOUT` | `120` | Download timeout in seconds. |
 
@@ -86,10 +92,11 @@ CDW_NOTIFY="ntfy,desktop"
 | `CDW_NTFY_USER`, `CDW_NTFY_PASSWORD` | empty | Basic authentication, used when no token is set. |
 | `CDW_NTFY_PRIORITY` | `default` | `min`, `low`, `default`, `high` or `urgent`. |
 | `CDW_NTFY_TAGS` | `books` | Comma separated tags. |
+| `CDW_NTFY_ATTACH` | `1` | Attach the diff page to the message. `0` sends the text alone. |
 
 A topic on ntfy.sh is public. Anyone who knows the name can read it and publish to it. Use a long random topic name, or a self hosted server with a token.
 
-Tapping the notification opens `CDW_URL`.
+The diff page is uploaded as a file attachment. ntfy.sh accepts attachments up to 15 MB and deletes them after 3 hours. A self hosted server accepts attachments when `attachment-cache-dir` and `base-url` are set in its `server.yml`. When the server rejects the attachment, the script logs an error and sends the text alone. Diff pages over 5 MB are not attached.
 
 ### Slack
 
@@ -109,7 +116,9 @@ Create the webhook at <https://api.slack.com/apps> under "Incoming Webhooks".
 | `CDW_SMTP_USER`, `CDW_SMTP_PASSWORD` | empty | SMTP credentials. |
 | `CDW_SMTP_STARTTLS` | `1` | Require STARTTLS on `smtp://` URLs. Set `0` for a local relay without TLS. |
 | `CDW_SENDMAIL` | `sendmail` on `PATH`, then `/usr/sbin/sendmail` | Sendmail command. |
-| `CDW_EMAIL_DIFF_LINES` | `200` | Diff lines included in the message. `0` omits the diff. |
+| `CDW_EMAIL_DIFF_LINES` | `200` | Diff lines included in the plain text part. `0` omits the diff. |
+
+The message has a plain text part and an HTML part. The HTML part is the diff page.
 
 Set `CDW_SMTP_URL` on machines without a configured mail transfer agent. A default macOS install has `sendmail` but does not relay to outside addresses.
 
@@ -119,13 +128,14 @@ Set `CDW_SMTP_URL` on machines without a configured mail transfer agent. A defau
 | :-- | :-- | :-- |
 | `CDW_DESKTOP_CMD` | `auto` | `auto`, `terminal-notifier`, `osascript` or `notify-send`. |
 
-`auto` uses the first command found, in that order. On macOS, allow notifications for terminal-notifier or Script Editor (the sender of `osascript` notifications) in System Settings, Notifications.
+`auto` uses the first command found, in that order. A click on a terminal-notifier notification opens the diff page in the browser. `osascript` and `notify-send` notifications have no click target. On macOS, allow notifications for terminal-notifier or Script Editor (the sender of `osascript` notifications) in System Settings, Notifications.
 
 ## Run
 
 ```sh
 claude-docs-watch              # fetch, commit, notify
 claude-docs-watch test-notify  # send a test message to every configured channel
+claude-docs-watch report       # rebuild the latest diff page and print its path
 claude-docs-watch --quiet      # print errors only
 ```
 
@@ -186,9 +196,51 @@ Run `crontab -e` and add:
 
 cron runs outside the desktop session. Use launchd or the systemd timer when the `desktop` channel is enabled. cron sets `PATH` to `/usr/bin:/bin`. Add a `PATH=` line to the crontab when git, curl or terminal-notifier live elsewhere.
 
+## See what changed
+
+```text
+~/.local/share/claude-docs-watch/changes/
+  index.html                                 history, newest first
+  latest.html                                copy of the newest diff page
+  2026-09-01-1432-claude-docs-changes.html   one page per change
+```
+
+Open the latest change:
+
+```sh
+open ~/.local/share/claude-docs-watch/changes/latest.html      # macOS
+xdg-open ~/.local/share/claude-docs-watch/changes/latest.html  # Linux
+```
+
+A diff page lists the changed pages, then shows each one like a git diff: removed lines in red, added lines in green, two lines of context, and the Markdown heading above each hunk. Inside a changed line the changed words are highlighted. Unchanged text over 400 characters inside a changed line is cut to its first and last 150. A new page is folded and opens on a click. A removed page is listed without its text.
+
+The file name carries the date and time of the commit (`YYYY-MM-DD-HHMM`). A second change in the same minute gets a `-2` suffix.
+
+How each channel delivers the diff page:
+
+| Channel | Delivery |
+| :-- | :-- |
+| desktop | A click on a terminal-notifier notification opens the page. |
+| ntfy | File attachment. |
+| email | HTML part of the message. |
+| slack | None. Incoming webhooks cannot upload files. The message carries the excerpts. |
+
+A channel that missed earlier changes receives one diff page covering all of them. That page is not stored, and its desktop click opens the history page.
+
+The diff pages are not committed. Rebuild them from the git history at any time:
+
+```sh
+claude-docs-watch report                 # the latest change
+claude-docs-watch report HEAD~3          # everything since three commits ago
+claude-docs-watch report abc1234 def5678 # between two commits
+claude-docs-watch report --all           # one page per recorded change, replacing the existing pages
+```
+
+`report` prints the path of every page it writes. `report --all` also creates pages for changes recorded before version 1.1.0.
+
 ## Browse the pages
 
-Open `~/.local/share/claude-docs-watch/docs/index.md`. It lists every page by title, grouped by directory.
+Open `~/.local/share/claude-docs-watch/docs/index.md`. It lists every page by title, grouped by directory, and links to the change history.
 
 * A page starts at a `# ` heading directly above a `Source:` line. Headings without a `Source:` line, such as `#` comments in code blocks, stay inside their page.
 * The file path comes from the page URL, relative to the directory of `CDW_URL`: `https://code.claude.com/docs/en/hooks` becomes `docs/en/hooks.md`.

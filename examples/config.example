@@ -15,6 +15,12 @@ CDW_NOTIFY=""
 # Directory inside the repository for one file per page plus index.md. Empty disables it.
 #CDW_DOCS_DIR="docs"
 
+# Directory inside the repository for the dated HTML diff pages. Empty disables them.
+#CDW_CHANGES_DIR="changes"
+
+# Maximum length of an excerpt in a notification. 0 lists the pages without excerpts.
+#CDW_EXCERPT_CHARS=150
+
 # ntfy. A topic on ntfy.sh is readable and writable by anyone who knows its name.
 #CDW_NTFY_TOPIC="claude-docs-CHANGE-ME"
 #CDW_NTFY_URL="https://ntfy.sh"
@@ -23,6 +29,8 @@ CDW_NOTIFY=""
 #CDW_NTFY_PASSWORD=""
 #CDW_NTFY_PRIORITY="default"
 #CDW_NTFY_TAGS="books"
+# Attach the diff page to the message. 0 sends the text alone.
+#CDW_NTFY_ATTACH=1
 
 # Slack incoming webhook.
 #CDW_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/XXXX"
